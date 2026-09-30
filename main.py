@@ -1,111 +1,173 @@
+import asyncio
 import io
-import os
 import json
+import os
 import wave
+from array import array
 import httpx
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-
+from fastapi import FastAPI, WebSocket, 
+WebSocketDisconnect
+VERSION = "v3"
+COHERE_API_KEY = 
+os.getenv("COHERE_API_KEY", "")
+COHERE_MODEL = os.getenv("COHERE_MODEL", 
+"cohere-transcribe-03-2026")
+COHERE_URL = 
+"https://api.cohere.com/v2/audio/transcript
+ions"
+SEND_MODE = os.getenv("SEND_MODE", 
+"binary").lower()
+CHUNK_SECONDS = 
+float(os.getenv("CHUNK_SECONDS", "4"))
+SILENCE_RMS = 
+float(os.getenv("SILENCE_RMS", "300"))
 app = FastAPI()
-COHERE_API_KEY = os.getenv("COHERE_API_KEY")
-COHERE_URL = "https://api.cohere.com/v2/audio/transcriptions"
-COHERE_MODEL = "cohere-transcribe-03-2026"
-
-# Se Omi continua a dare "Unsupported message type: String",
-# metti True (frame binario). Se invece va bene il testo, metti False.
-SEND_AS_BINARY = False
-
-CHUNK_SECONDS = 3
-
-
-def pcm_to_wav(pcm: bytes, rate: int) -> bytes:
+@app.get("/")
+def home():
+    return {
+        "status": "Omi Cohere Proxy 
+Running",
+        "version": VERSION,
+        "send_mode": SEND_MODE,
+        "chunk_seconds": CHUNK_SECONDS,
+        "cohere_key_set": 
+bool(COHERE_API_KEY),
+    }
+def pcm_to_wav(pcm: bytes, rate: int) -> 
+bytes:
     buf = io.BytesIO()
     with wave.open(buf, "wb") as w:
         w.setnchannels(1)
-        w.setsampwidth(2)  # PCM16
+        w.setsampwidth(2)
         w.setframerate(rate)
         w.writeframes(pcm)
     return buf.getvalue()
-
-
-@app.get("/")
-def home():
-    return {"status": "Omi Cohere Proxy Running"}
-
-
+def rms(pcm: bytes) -> float:
+    """Rough loudness of PCM16 audio 
+(samples subsampled for speed)."""
+    samples = array("h")
+    samples.frombytes(pcm[: len(pcm) - 
+(len(pcm) % 2)])
+    if not samples:
+        return 0.0
+    step = 8
+    picked = samples[::step]
+    return (sum(s * s for s in picked) / 
+len(picked)) ** 0.5
+async def send_to_omi(ws: WebSocket, 
+payload: dict) -> None:
+    raw = json.dumps(payload, 
+ensure_ascii=False)
+    if SEND_MODE == "text":
+        await ws.send_text(raw)
+    else:
+        await 
+ws.send_bytes(raw.encode("utf-8"))
+async def transcribe(client: 
+httpx.AsyncClient, pcm: bytes, rate: int, 
+lang: str) -> str:
+    resp = await client.post(
+        COHERE_URL,
+        headers={"Authorization": f"Bearer 
+{COHERE_API_KEY}"},
+        files={"file": ("speech.wav", 
+pcm_to_wav(pcm, rate), "audio/wav")},
+        data={"model": COHERE_MODEL, 
+"language": lang},
+    )
+    if resp.status_code != 200:
+        print(f"[cohere] 
+{resp.status_code}: {resp.text[:300]}")
+        return ""
+    return (resp.json().get("text") or 
+"").strip()
 @app.websocket("/cohere-live-stt")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-
-    language = websocket.query_params.get("language", "it")
+async def cohere_live_stt(ws: WebSocket):
+    await ws.accept()
+    lang = ws.query_params.get("language", 
+"it")
     try:
-        rate = int(websocket.query_params.get("sample_rate", 16000))
+        rate = 
+int(ws.query_params.get("sample_rate", 
+16000))
     except ValueError:
         rate = 16000
-
-    chunk_bytes = rate * 2 * CHUNK_SECONDS  # 16-bit mono
-    buffer = bytearray()
-    elapsed = 0.0  # secondi di audio già trascritti
-
-    print(f"Connesso: language={language}, sample_rate={rate}")
-
-    async with httpx.AsyncClient(timeout=30) as client:
-        try:
+    chunk_bytes = int(rate * 2 * 
+CHUNK_SECONDS)
+    queue: asyncio.Queue = asyncio.Queue()
+    print(f"[ws] connected lang={lang} 
+rate={rate} mode={SEND_MODE} version=
+{VERSION}")
+    async def worker():
+        async with 
+httpx.AsyncClient(timeout=30) as client:
             while True:
-                message = await websocket.receive()
-
-                if message["type"] == "websocket.disconnect":
-                    break
-
-                data = message.get("bytes")
-                if not data:
-                    # messaggi di testo/controllo: ignorati
-                    continue
-
-                buffer.extend(data)
-                if len(buffer) < chunk_bytes:
-                    continue
-
-                pcm = bytes(buffer)
-                buffer.clear()
-                duration = len(pcm) / (rate * 2)
-                t0, t1 = elapsed, elapsed + duration
-                elapsed = t1
-
-                response = await client.post(
-                    COHERE_URL,
-                    headers={"Authorization": f"Bearer {COHERE_API_KEY}"},
-                    files={"file": ("speech.wav", pcm_to_wav(pcm, rate), "audio/wav")},
-                    data={"model": COHERE_MODEL, "language": language},
-                )
-
-                if response.status_code != 200:
-                    print(f"Cohere {response.status_code}: {response.text[:300]}")
-                    continue
-
-                text = response.json().get("text", "").strip()
-                if not text:
-                    continue
-
-                payload = json.dumps(
-                    {
+                item = await queue.get()
+                if item is None:
+                    return
+                pcm, t0, t1 = item
+                try:
+                    text = await 
+transcribe(client, pcm, rate, lang)
+                    if not text:
+                        continue
+                    payload = {
                         "segments": [
                             {
-                                "text": text,
-                                "speaker": "SPEAKER_00",
-                                "start": round(t0, 2),
-                                "end": round(t1, 2),
+                                "text": 
+text,
+"SPEAKER_00",
+                                "speaker": 
+                                "start": 
+round(t0, 2),
+round(t1, 2),
+                                "end": 
                             }
                         ]
                     }
-                )
-
-                if SEND_AS_BINARY:
-                    await websocket.send_bytes(payload.encode("utf-8"))
-                else:
-                    await websocket.send_text(payload)
-
-        except WebSocketDisconnect:
-            print("Omi disconnesso")
-        except Exception as e:
-            print(f"Errore: {e!r}")
-                
+                    print(f"[send:
+{SEND_MODE}] {payload}")
+                    await send_to_omi(ws, 
+payload)
+                except Exception as e:
+                    print(f"[worker] error: 
+{e!r}")
+                    return
+    worker_task = 
+asyncio.create_task(worker())
+    buffer = bytearray()
+    elapsed = 0.0
+    try:
+        while True:
+            msg = await ws.receive()
+            if msg["type"] == 
+"websocket.disconnect":
+                break
+            data = msg.get("bytes")
+            if not data:
+                continue  # ignore 
+text/control frames
+            buffer.extend(data)
+            if len(buffer) < chunk_bytes:
+                continue
+            pcm = bytes(buffer)
+            buffer.clear()
+            dur = len(pcm) / (rate * 2)
+            t0, t1 = elapsed, elapsed + dur
+            elapsed = t1
+            if rms(pcm) < SILENCE_RMS:
+                continue  # silence: skip 
+the API call
+            await queue.put((pcm, t0, t1))
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        print(f"[ws] error: {e!r}")
+    finally:
+        await queue.put(None)
+        try:
+            await 
+asyncio.wait_for(worker_task, timeout=10)
+        except Exception:
+            worker_task.cancel()
+        print("[ws] closed")
