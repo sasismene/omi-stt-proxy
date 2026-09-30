@@ -12,7 +12,7 @@ COHERE_MODEL = "cohere-transcribe-03-2026"
 
 # Se Omi continua a dare "Unsupported message type: String",
 # metti True (frame binario). Se invece va bene il testo, metti False.
-SEND_AS_BINARY = True
+SEND_AS_BINARY = False
 
 CHUNK_SECONDS = 3
 
