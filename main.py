@@ -17,25 +17,14 @@ async def websocket_endpoint(websocket: WebSocket):
 
     try:
         while True:
-            # Riceve qualsiasi tipo di messaggio da Omi (Testo o Bytes)
+            # Riceve il messaggio generico dal socket
             message = await websocket.receive()
 
-            # 1. Gestione messaggi di Testo / Setup da Omi
-            if "text" in message and message["text"]:
-                text_data = message["text"]
-                try:
-                    data_json = json.loads(text_data)
-                    # Se Omi invia un messaggio di configurazione/setup, confermiamo la connessione
-                    if data_json.get("type") == "setup" or "language" in data_json:
-                        await websocket.send_text(json.dumps({"status": "ready"}))
-                except json.JSONDecodeError:
-                    pass
-
-            # 2. Gestione Audio Binario (Chunk dal microfono)
-            elif "bytes" in message and message["bytes"]:
+            # 1. Se Omi invia dati audio binari (i chunk del microfono)
+            if "bytes" in message and message["bytes"]:
                 buffer.extend(message["bytes"])
 
-                # Ogni ~3 secondi di audio accumulato (~96KB) inviamo a Cohere
+                # Ogni ~3 secondi di audio accumulato (~96KB)
                 if len(buffer) > 96000:
                     audio_chunk = bytes(buffer)
                     buffer.clear()
@@ -49,16 +38,26 @@ async def websocket_endpoint(websocket: WebSocket):
                         )
 
                         if response.status_code == 200:
-                            transcript = response.json().get("text", "")
-                            if transcript.strip():
-                                # Formato esatto per visualizzare il testo su Omi
-                                await websocket.send_text(json.dumps({
-                                    "text": transcript,
-                                    "is_final": True
-                                }))
+                            transcript_text = response.json().get("text", "")
+                            if transcript_text.strip():
+                                # Invia la risposta strutturata a Omi
+                                response_data = {
+                                    "text": transcript_text,
+                                    "segments": [
+                                        {
+                                            "text": transcript_text,
+                                            "start": 0.0,
+                                            "end": 3.0
+                                        }
+                                    ]
+                                }
+                                await websocket.send_text(json.dumps(response_data))
+
+            # 2. Se Omi invia messaggi di controllo in testo (ignora in silenzio per non generare warning)
+            elif "text" in message:
+                continue
 
     except WebSocketDisconnect:
-        print("Omi disconnesso")
+        print("Omi Disconnesso")
     except Exception as e:
-        print(f"Errore Proxy: {str(e)}")
-        
+        print(f"Errore: {str(e)}")
