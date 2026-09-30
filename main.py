@@ -1,3 +1,26 @@
+"""
+Omi <-> Cohere STT bridge.
+Omi (custom STT, request_type "streaming") 
+opens a WebSocket to /cohere-live-stt
+and sends raw PCM16 mono audio as binary 
+frames.
+This server buffers the audio in chunks, 
+sends each chunk to Cohere as WAV,
+and replies to Omi with JSON: {"segments": 
+[{"text", "speaker", "start", "end"}]}
+Environment variables (Render -> 
+Environment):
+  COHERE_API_KEY   required
+  COHERE_MODEL     default: cohere
+transcribe-03-2026
+  SEND_MODE        "binary" (default) or 
+"text"  -> how the JSON reaches Omi
+  CHUNK_SECONDS    default: 4
+  SILENCE_RMS      default: 300  (chunks 
+quieter than this are skipped)
+Start command: uvicorn main:app --host 
+0.0.0.0 --port $PORT
+"""
 import asyncio
 import io
 import json
